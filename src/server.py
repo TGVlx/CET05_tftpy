@@ -1,278 +1,226 @@
-# vim: ts=4 sw=4 et ai:
-"""This module implements the TFTP Server functionality.
-Logging is performed via a standard logging object set in
-TftpShared."""
 
-
-import logging
-import os
-import select
 import socket
-import threading
-import time
-from errno import EINTR
+from time import time, sleep
+from textwrap import dedent
+from socket import AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR
+import sys
+import struct
+import os
+import os.path
+import re
+import tftp
+from docopt import docopt
+from socketserver import BaseRequestHandler, ThreadingUDPServer
+from threading import Thread
 
-from .TftpContexts import TftpContextServer
-from .TftpPacketFactory import TftpPacketFactory
-from .TftpPacketTypes import *
-from .TftpShared import *
+host = ''  # Symbolic name meaning all available interfaces
 
-log = logging.getLogger("tftpy.TftpServer")
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(SOL_SOCKET, SO_REUSEADDR, True)
+ThreadingUDPServer.allow_reuse_address = True
+
+doc = """
+TFTPy: The server side for the TFTP protocol. written in Python 3 by Pedro Pereira & Pedro Lourenço (11/06/17)
+
+Usage: server.py [<directory>] [<port>]
+
+Options:
+  -h, --help
+  [<directory>]             show this help [default: './']        
+  <port>,   <port>=<port>   listening port [default: 69]
+"""
+
+args = docopt(doc)
 
 
-class TftpServer(TftpSession):
-    """This class implements a tftp server object. Run the listen() method to
-    listen for client requests.
+if args['<directory>'] == None:
+    args['<directory>'] = './'
+if args['<port>'] == None:
+    args['<port>'] = 69
 
-    tftproot is the path to the tftproot directory to serve files from and/or
-    write them to.
+try:
+    v = int(args['<directory>'] )
+    args['<port>'] = v
+    args['<directory>'] = './'
+    
+except ValueError: 
+    if len(sys.argv) == 1:
+        args['<directory>'] = './'
+    else:
+        args['<directory>'] = sys.argv[1]
 
-    dyn_file_func is a callable that takes a requested download
-    path that is not present on the file system and must return either a
-    file-like object to read from or None if the path should appear as not
-    found. This permits the serving of dynamic content.
+except IndexError:
+    if len(sys.argv) == 0:
+        args['<directory>'] = './'
 
-    upload_open is a callable that is triggered on every upload with the
-    requested destination path and server context. It must either return a
-    file-like object ready for writing or None if the path is invalid."""
+port = int(args['<port>'])
+hostname = socket.gethostname()
+ip = socket.gethostbyname(hostname)
+addr = host, port
 
-    def __init__(self, tftproot="/tftpboot", dyn_file_func=None, upload_open=None):
-        self.listenip = None
-        self.listenport = None
-        self.sock = None
-        # FIXME: What about multiple roots?
-        self.root = os.path.abspath(tftproot)
-        self.dyn_file_func = dyn_file_func
-        self.upload_open = upload_open
-        # A dict of sessions, where each session is keyed by a string like
-        # ip:tid for the remote end.
-        self.sessions = {}
-        # A threading event to help threads synchronize with the server
-        # is_running state.
-        self.is_running = threading.Event()
+RRQ = b'\x00\x01'
+WRQ = b'\x00\x02'
+DAT = b'\x00\x03'
+ACK = b'\x00\x04'
+ERR = b'\x00\x05'
+DIR = b'\x00\x06'
 
-        self.shutdown_gracefully = False
-        self.shutdown_immediately = False
+BLK0 = b'\x00\x00'
+BLK1 = b'\x00\x01'
 
-        for name in "dyn_file_func", "upload_open":
-            attr = getattr(self, name)
-            if attr and not callable(attr):
-                raise TftpException(f"{name} supplied, but it is not callable.")
-        if os.path.exists(self.root):
-            log.debug("tftproot %s does exist", self.root)
-            if not os.path.isdir(self.root):
-                raise TftpException("The tftproot must be a directory.")
-            else:
-                log.debug("tftproot %s is a directory" % self.root)
-                if os.access(self.root, os.R_OK):
-                    log.debug("tftproot %s is readable" % self.root)
-                else:
-                    raise TftpException("The tftproot must be readable")
-                if os.access(self.root, os.W_OK):
-                    log.debug("tftproot %s is writable" % self.root)
-                else:
-                    log.warning("The tftproot %s is not writable" % self.root)
-        else:
-            raise TftpException("The tftproot does not exist.")
+path = args['<directory>']
+path_chk = path[-1]
 
-    def listen(
-        self,
-        listenip="",
-        listenport=DEF_TFTP_PORT,
-        timeout=SOCK_TIMEOUT,
-        retries=DEF_TIMEOUT_RETRIES,
-    ):
-        """Start a server listening on the supplied interface and port. This
-        defaults to INADDR_ANY (all interfaces) and UDP port 69. You can also
-        supply a different socket timeout value, if desired."""
-        tftp_factory = TftpPacketFactory()
+if not path_chk  == '/':
+    print("The inserted path of directory don't end with slash '/'!\n Please do it to save correctly the files. ")
+    raise SystemExit
 
-        # Don't use new 2.5 ternary operator yet
-        # listenip = listenip if listenip else '0.0.0.0'
-        if not listenip:
-            listenip = "0.0.0.0"
-        log.info(f"Server requested on ip {listenip}, port {listenport}")
-        try:
-            # FIXME - sockets should be non-blocking
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.bind((listenip, listenport))
-            _, self.listenport = self.sock.getsockname()
-        except OSError as err:
-            # Reraise it for now.
-            raise err
 
-        self.is_running.set()
+### LIGAÇÕES UDP Bind ###
 
-        log.info("Starting receive loop...")
-        while True:
-            log.debug("shutdown_immediately is %s" % self.shutdown_immediately)
-            log.debug("shutdown_gracefully is %s" % self.shutdown_gracefully)
-            if self.shutdown_immediately:
-                log.info("Shutting down now. Session count: %d" % len(self.sessions))
-                self.sock.close()
-                for key in self.sessions:
-                    log.warning("Forcefully closed session with %s" %
-                        self.sessions[key].host)
-                    self.sessions[key].end()
-                self.sessions = []
-                break
+try:    
+    s.bind(addr)
+    print('Socket bind complete')
+except socket.error as msg:
+    print('Unable to bind to port %d' % (port))
+    sys.exit()
 
-            elif self.shutdown_gracefully:
-                if not self.sessions:
-                    log.info("In graceful shutdown mode and all "
-                             "sessions complete.")
-                    self.sock.close()
-                    break
+ct6 = 0
+ct4 = 0
+ct = 0
+buf = 65536
 
-            # Build the inputlist array of sockets to select() on.
-            inputlist = [self.sock]
-            for key in self.sessions:
-                inputlist.append(self.sessions[key].sock)
+while True:
+    
+    try:
+        print( "Waiting for requests on '%s' port '%s'\n" % (hostname, args['<port>']))
+       
+        data, addr = s.recvfrom(buf)
+        host = addr[0]
+        port = addr[1]       
+        
+        print ('received %s bytes from %s' % (len(data), addr))
+                
+        pack_type = tftp.check_pack(data)
+        op = data[:2]
+        bloco = data[2:4]
+    
 
-            # Block until some socket has input on it.
-            log.debug("Performing select on this inputlist: %s", inputlist)
-            try:
-                readyinput, readyoutput, readyspecial = select.select(
-                    inputlist, [], [], timeout
-                )
-            except OSError as err:
-                if err[0] == EINTR:
-                    # Interrupted system call
-                    log.debug("Interrupted syscall, retrying")
-                    continue
-                else:
-                    raise
+        # LEITURA DO PACOTE 1 (RRQ)
+        if pack_type == RRQ:
 
-            deletion_list = []
+            unpacked = tftp.treat_RQQ_srv(data, path)
+            if len(unpacked) == 2:
+                file_O, file = unpacked
+                op = 3
+                blocks = tftp.chunks(file_O, 512)
+                info_file = next(blocks, 'end')
+                if info_file == 'end':
+                    file_out = file.rsplit(b'/')
+                    print("The file requested, '%s' has been sent." % (file_out.decode()))
+                info_file += b'\0'
+                numb_blk = next(blocks, 'end')
+                packet_DAT = tftp.pack_3_(op, numb_blk, info_file)
+                filen = file.decode()
+                s.sendto(packet_DAT, addr)
+         
+            if len(unpacked) == 3:
+                send_err, msg, err = unpacked
+                s.sendto(send_err, addr)
+         
 
-            # Handle the available data, if any. Maybe we timed-out.
-            for readysock in readyinput:
-                # Is the traffic on the main server socket? ie. new session?
-                if readysock == self.sock:
-                    log.debug("Data ready on our main socket")
-                    buffer, (raddress, rport) = self.sock.recvfrom(MAX_BLKSIZE)
+        # LEITURA DO PACOTE 2 (WRQ)        
+        if pack_type == WRQ:
+ 
+            output = tftp.treat_WRQ_srv(data, path)
+            if len(output) == 2:
+                ack_send, filen = output
+                if filen == False:
+                    print('File not found! [error 1]')
+            if len(output) == 3:
+                ack_send, filen, file_to_save = output
+                if filen == False:
+                    print('File not found! [error 1]')   
+            
+            s.sendto(ack_send, addr)
 
-                    log.debug("Read %d bytes", len(buffer))
 
-                    if self.shutdown_gracefully:
-                        log.warning(
-                            "Discarding data on main port, in graceful shutdown mode"
-                        )
-                        continue
+        # LEITURA DO PACOTE 3 (DAT)
+        if pack_type == DAT:
+   
+            blk = data[2:4]
 
-                    # Forge a session key based on the client's IP and port,
-                    # which should safely work through NAT.
-                    key = f"{raddress}:{rport}"
+            if len(output) == 2:
+                if blk == BLK1:
+                    ack_send, namesaved = tftp.treat_DAT1_srv(data, filen)
+                if blk > BLK1:
+                    ack_send, namesaved = tftp.treat_DAT2(data, namesaved)
+            if len(output) == 3:
+                if blk == BLK1:
+                    ack_send, namesaved = tftp.treat_DAT1_srv(data, file_to_save)
+                if blk > BLK1:
+                    ack_send, namesaved = tftp.treat_DAT2(data, namesaved)
+            s.sendto(ack_send, addr)
+           
 
-                    if key not in self.sessions:
-                        log.debug(
-                            "Creating new server context for session key = %s" % key
-                        )
-                        self.sessions[key] = TftpContextServer(
-                            raddress,
-                            rport,
-                            timeout,
-                            self.root,
-                            self.dyn_file_func,
-                            self.upload_open,
-                            retries=retries,
-                        )
-                        try:
-                            self.sessions[key].start(buffer)
-                        except TftpTimeoutExpectACK:
-                            self.sessions[key].timeout_expectACK = True
-                        except TftpException as err:
-                            deletion_list.append(key)
-                            log.error(
-                                "Fatal exception thrown from session %s: %s"
-                                % (key, str(err))
-                            )
-                    else:
-                        log.warning(
-                            "received traffic on main socket for existing session??"
-                        )
-                    log.info("Currently handling these sessions:")
-                    for session_key, session in list(self.sessions.items()):
-                        log.info("    %s" % session)
+        #LEITURA DO PACOTE 4 (ACK)       
+        if pack_type == ACK:
+      
+            op = 3
+            ct4 += 1
+                        
+            inf = next(blocks, 'end')
+            file = str(file).strip("[]")
+            
+            if inf == 'end':
+                file_out = filen.rsplit('/')
+                print("The file requested, '%s' has been sent.\n" % (file_out[-1]))
+                ct4 = 0
+                continue
+       
+            numb_blk = next(blocks,'end')            
+            packet = tftp.pack_3_(op, numb_blk, inf)
+            s.sendto(packet, addr)
+        
 
-                else:
-                    # Must find the owner of this traffic.
-                    for key in self.sessions:
-                        if readysock == self.sessions[key].sock:
-                            log.debug("Matched input to session key %s" % key)
-                            self.sessions[key].timeout_expectACK = False
-                            try:
-                                self.sessions[key].cycle()
-                                if self.sessions[key].state is None:
-                                    log.info("Successful transfer.")
-                                    deletion_list.append(key)
-                            except TftpTimeoutExpectACK:
-                                self.sessions[key].timeout_expectACK = True
-                            except TftpException as err:
-                                deletion_list.append(key)
-                                log.error(
-                                    "Fatal exception thrown from session %s: %s"
-                                    % (key, str(err))
-                                )
-                            # Break out of for loop since we found the correct
-                            # session.
-                            break
-                    else:
-                        log.error("Can't find the owner for this packet. Discarding.")
+        # LEITURA DO PACOTE 5 (ERR)
+        if pack_type == ERR:
 
-            log.debug("Looping on all sessions to check for timeouts")
-            now = time.time()
-            for key in self.sessions:
-                try:
-                    self.sessions[key].checkTimeout(now)
-                except TftpTimeout as err:
-                    log.error(str(err))
-                    self.sessions[key].retry_count += 1
-                    if self.sessions[key].retry_count >= self.sessions[key].retries:
-                        log.debug(
-                            "hit max retries on %s, giving up" % self.sessions[key]
-                        )
-                        deletion_list.append(key)
-                    else:
-                        log.debug("resending on session %s" % self.sessions[key])
-                        self.sessions[key].state.resendLast()
+            info = tftp.unpack_err(data)
+            op, err, msg = info
+            print('%s' % (err, msg))
+            continue
+            
+        if pack_type == DIR:
+            ct6 += 1
+            path = args['<directory>']
 
-            log.debug("Iterating deletion list.")
-            for key in deletion_list:
-                log.info("")
-                log.info("Session %s complete" % key)
-                if key in self.sessions:
-                    log.debug("Gathering up metrics from session before deleting")
-                    self.sessions[key].end()
-                    metrics = self.sessions[key].metrics
-                    if metrics.duration == 0:
-                        log.info("Duration too short, rate undetermined")
-                    else:
-                        log.info(
-                            "Transferred %d bytes in %.2f seconds"
-                            % (metrics.bytes, metrics.duration)
-                        )
-                        log.info("Average rate: %.2f kbps" % metrics.kbps)
-                    log.info("%.2f bytes in resent data" % metrics.resent_bytes)
-                    log.info("%d duplicate packets" % metrics.dupcount)
-                    log.debug("Deleting session %s" % key)
-                    del self.sessions[key]
-                    log.debug("Session list is now %s" % self.sessions)
-                else:
-                    log.warning("Strange, session %s is not on the deletion list" % key)
+            dir_srv = os.popen('ls -alh {}'.format(path)).read()
+            if ct6 == 1:
+                part_block = tftp.chunks(dir_srv, 512)
+            
+            inf = next(part_block, 'end')
+            if inf == 'end':
+                print('DIR sended')
+                ct6 = 0
+                continue
+              
+            numb_blk = next(part_block, 'end')
+            op = 3
+            dir_srv_S = tftp.pack_3_dir(op, numb_blk, inf)
+            sent = s.sendto(dir_srv_S, addr)        
+ 
+            
+    except socket.timeout:
+        print('Trying again...')
+        ct += 1
+        s.connect(addr)
+        s.settimeout(10)        
+        break
 
-        self.is_running.clear()
+    except KeyboardInterrupt:
+        print("Exiting TFTP server..")
+        print("Goodbye!")
+        break
 
-        log.debug("server returning from while loop")
-        self.shutdown_gracefully = self.shutdown_immediately = False
-
-    def stop(self, now=False):
-        """Stop the server gracefully. Do not take any new transfers,
-        but complete the existing ones. If force is True, drop everything
-        and stop. Note, immediately will not interrupt the select loop, it
-        will happen when the server returns on ready data, or a timeout.
-        ie. SOCK_TIMEOUT"""
-        if now:
-            self.shutdown_immediately = True
-        else:
-            self.shutdown_gracefully = True
+s.close()
